@@ -2,6 +2,7 @@ name: Sync LeetCode
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 8 * * *"
 
@@ -13,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ----------------------------------------
+      # 1. Sync accepted LeetCode submissions
+      # ----------------------------------------
       - name: Sync LeetCode submissions
         uses: joshcai/leetcode-sync@v1.7
         with:
@@ -22,3 +27,237 @@ jobs:
           destination-folder: solutions
           verbose: true
           commit-header: "[LeetCode Sync]"
+
+      # ----------------------------------------
+      # 2. Download the latest repository state
+      # ----------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ----------------------------------------
+      # 3. Convert internal LeetCode IDs
+      #    to normal frontend problem numbers
+      # ----------------------------------------
+      - name: Fix LeetCode problem numbers
+        env:
+          LEETCODE_SESSION: ${{ secrets.LEETCODE_SESSION }}
+          LEETCODE_CSRF_TOKEN: ${{ secrets.LEETCODE_CSRF_TOKEN }}
+
+        run: |
+
+          python - <<'PY'
+
+          import os
+          import re
+          import json
+          import urllib.request
+
+
+          SOLUTIONS_DIR = "solutions"
+
+          session = os.environ["LEETCODE_SESSION"]
+          csrf = os.environ["LEETCODE_CSRF_TOKEN"]
+
+
+          # ----------------------------------------
+          # Get problem information from LeetCode
+          # ----------------------------------------
+
+          def get_problem_data(title_slug):
+
+              query = """
+              query questionData($titleSlug: String!) {
+                question(titleSlug: $titleSlug) {
+                  questionId
+                  questionFrontendId
+                  title
+                  titleSlug
+                }
+              }
+              """
+
+              payload = json.dumps({
+                  "query": query,
+                  "variables": {
+                      "titleSlug": title_slug
+                  }
+              }).encode("utf-8")
+
+
+              request = urllib.request.Request(
+                  "https://leetcode.com/graphql",
+                  data=payload,
+                  method="POST",
+                  headers={
+                      "Content-Type": "application/json",
+                      "Cookie": (
+                          f"LEETCODE_SESSION={session}; "
+                          f"csrftoken={csrf}"
+                      ),
+                      "x-csrftoken": csrf,
+                      "Referer": "https://leetcode.com/"
+                  }
+              )
+
+
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.loads(response.read())
+
+
+          # ----------------------------------------
+          # Check every solution folder
+          # ----------------------------------------
+
+          if not os.path.exists(SOLUTIONS_DIR):
+              print("No solutions directory found.")
+              exit(0)
+
+
+          renamed = False
+
+
+          for folder in os.listdir(SOLUTIONS_DIR):
+
+              folder_path = os.path.join(SOLUTIONS_DIR, folder)
+
+
+              if not os.path.isdir(folder_path):
+                  continue
+
+
+              # Expected format:
+              # 1798-max-number-of-k-sum-pairs
+
+              match = re.match(
+                  r"^(\d+)-(.+)$",
+                  folder
+              )
+
+
+              if not match:
+                  continue
+
+
+              current_id = match.group(1)
+              title_slug = match.group(2)
+
+
+              print()
+              print("----------------------------------------")
+              print(f"Checking: {folder}")
+              print(f"Current ID: {current_id}")
+              print(f"Slug: {title_slug}")
+
+
+              try:
+
+                  result = get_problem_data(title_slug)
+
+                  question = (
+                      result
+                      .get("data", {})
+                      .get("question")
+                  )
+
+
+                  if not question:
+                      print("Could not find problem.")
+                      continue
+
+
+                  frontend_id = str(
+                      question["questionFrontendId"]
+                  )
+
+
+                  title = question["title"]
+
+
+                  print(f"LeetCode number: {frontend_id}")
+                  print(f"Title: {title}")
+
+
+                  # Already correct
+                  if current_id == frontend_id:
+                      print("Already correct.")
+                      continue
+
+
+                  new_folder = f"{frontend_id}-{title_slug}"
+
+                  new_folder_path = os.path.join(
+                      SOLUTIONS_DIR,
+                      new_folder
+                  )
+
+
+                  # Don't overwrite an existing folder
+                  if os.path.exists(new_folder_path):
+                      print(
+                          f"Target already exists: {new_folder}"
+                      )
+                      continue
+
+
+                  print(
+                      f"Renaming: {folder} -> {new_folder}"
+                  )
+
+
+                  os.rename(
+                      folder_path,
+                      new_folder_path
+                  )
+
+
+                  renamed = True
+
+
+              except Exception as error:
+
+                  print(
+                      f"Error processing {folder}: {error}"
+                  )
+
+
+          print()
+          print("----------------------------------------")
+
+
+          if renamed:
+              print("Problem numbers were corrected.")
+          else:
+              print("No folders needed correction.")
+
+          PY
+
+
+      # ----------------------------------------
+      # 4. Commit corrected folder names
+      # ----------------------------------------
+      - name: Commit corrected problem numbers
+        run: |
+
+          git config user.name "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+
+          git add solutions/
+
+
+          if git diff --cached --quiet; then
+
+            echo "No changes to commit."
+
+          else
+
+            git commit \
+              -m "[LeetCode Sync] Fix problem numbers"
+
+            git push
+
+          fi
